@@ -91,3 +91,61 @@ a005 LOGOUT
 - **HTML stripping**: Any HTML in incoming messages is automatically stripped to plain text
 - **Flag sync**: `\Flagged` ↔ `TODO`, `\Deleted` triggers removal on `EXPUNGE`
 - **Bidirectional**: Edit the org file externally (e.g., in Emacs) and changes propagate to connected IMAP clients
+
+----
+
+2:
+
+
+
+
+# Org-Mode IMAP Server (v2)
+
+## Key design changes from v1
+
+1. **No duplicate messages** — each message lives only in its deepest `***` folder; parent folders show nothing
+2. **All times are local timezone** — no UTC assumptions
+3. **HTML→Markdown conversion** — incoming HTML is converted to markdown, not stripped
+4. **UTF-8 subjects** — MIME-encoded subjects are decoded to raw UTF-8 in the org file
+5. **Base64/quoted-printable body decoded** — stored as plain UTF-8
+
+
+## Build & Run
+
+```bash
+go build -o orgmail main.go
+./orgmail mail.org 127.0.0.1:1143
+```
+
+## Behavior Summary
+
+| Aspect | Behavior |
+|--------|----------|
+| **Message location** | Each message lives in exactly one `***` folder; year/month folders are `\Noselect` containers only |
+| **INBOX** | Virtual folder returning all messages (convenience for simple clients) |
+| **Timezone** | All dates stored and displayed in server's local timezone; incoming dates converted |
+| **HTML email** | Converted to org-compatible markdown (`**bold**`, `*italic*`, `[[link][text]]`, `#+BEGIN_QUOTE`, etc.) |
+| **Base64 body** | Decoded to plain UTF-8 before storing |
+| **Quoted-printable** | Decoded to plain UTF-8 before storing |
+| **MIME subject** | RFC 2047 `=?UTF-8?B?...?=` decoded to raw UTF-8 in org file |
+| **Content-Transfer-Encoding** | Output uses `8bit` (no base64 in org file) |
+| **Leading blank lines** | Stripped from body before storing |
+| **TODO ↔ \\Flagged** | Bidirectional mapping |
+| **File watching** | Polls every 3s + on NOOP/IDLE; external edits propagate to clients |
+| **IDLE** | Supported; polls every 2s during idle |
+| **Folder hierarchy** | `/` separator: `2026/2026-06 June/2026-06-12 Friday` |
+
+## Example org file after receiving an HTML email
+
+```org
+* 2026
+** 2026-06 June
+*** 2026-06-12 Friday
+**** [2026-06-12 Fri 15:58] Meeting Notes
+**Weekly Standup**
+
+- Review progress
+- Plan next sprint
+
+[[/fwd?q=aHR0cHM6Ly9leGFtcGxlLmNvbQ==][Click here]] for details
+```

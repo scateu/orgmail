@@ -3,11 +3,15 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/md5"
+	"encoding/base64"
 	"fmt"
-	"html"
 	"io"
 	"log"
+	"mime"
+	"mime/multipart"
+	"mime/quotedprintable"
 	"net"
 	"os"
 	"os/signal"
@@ -25,65 +29,52 @@ import (
 // Org-mode data model
 // ---------------------------------------------------------------------------
 
-// OrgMessage represents a single **** heading = one email message.
 type OrgMessage struct {
-	UID       uint32
-	Date      time.Time
-	Subject   string
-	Body      string
-	Flags     []string // e.g. "\\Seen", "\\Flagged"
-	IsTODO    bool
-	RawHeader string // the **** line as-is (minus leading stars)
+	UID     uint32
+	Date    time.Time
+	Subject string
+	Body    string
+	Flags   []string
+	IsTODO  bool
 }
 
-// OrgDay represents a *** heading (day grouping).
 type OrgDay struct {
-	Title    string // e.g. "2026-06-12 Friday"
+	Title    string
 	Messages []*OrgMessage
 }
 
-// OrgMonth represents a ** heading (month grouping).
 type OrgMonth struct {
-	Title string // e.g. "2026-06 June"
+	Title string
 	Days  []*OrgDay
 }
 
-// OrgYear represents a * heading (year grouping).
 type OrgYear struct {
-	Title  string // e.g. "2026"
+	Title  string
 	Months []*OrgMonth
 }
 
-// OrgStore is the entire mail store backed by one org file.
 type OrgStore struct {
-	mu       sync.RWMutex
-	filePath string
-	years    []*OrgYear
-	nextUID  uint32
-	modTime  time.Time
-
-	// UID validity counter – bumped when we do a full reload that
-	// might re-assign UIDs (we try not to).
+	mu          sync.RWMutex
+	filePath    string
+	years       []*OrgYear
+	nextUID     uint32
+	modTime     time.Time
 	uidValidity uint32
-
-	// Global UID -> message pointer for fast lookup
-	uidMap map[uint32]*OrgMessage
-
-	// For file-change detection
-	lastHash [16]byte
+	uidMap      map[uint32]*OrgMessage
+	lastHash    [16]byte
+	localLoc    *time.Location
 }
 
 func NewOrgStore(path string) *OrgStore {
-	s := &OrgStore{
+	return &OrgStore{
 		filePath:    path,
 		nextUID:     1,
 		uidValidity: uint32(time.Now().Unix()),
 		uidMap:      make(map[uint32]*OrgMessage),
+		localLoc:    time.Now().Location(),
 	}
-	return s
 }
 
-// Load reads and parses the org file.
 func (s *OrgStore) Load() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -102,7 +93,7 @@ func (s *OrgStore) loadLocked() error {
 
 	newHash := md5.Sum(data)
 	if newHash == s.lastHash {
-		return nil // no change
+		return nil
 	}
 	s.lastHash = newHash
 
@@ -111,7 +102,6 @@ func (s *OrgStore) loadLocked() error {
 		s.modTime = info.ModTime()
 	}
 
-	// Re-parse
 	s.years = nil
 	s.uidMap = make(map[uint32]*OrgMessage)
 	s.nextUID = 1
@@ -127,9 +117,8 @@ var (
 	reH3 = regexp.MustCompile(`^\*\*\*\s+(.+)$`)
 	reH4 = regexp.MustCompile(`^\*\*\*\*\s+(.+)$`)
 
-	// Match the timestamp + subject in a **** line
-	// e.g. "TODO [2026-06-11 Thu 14:01] 道同学休假一天"
-	// or   "[2026-06-12 Fri 15:58] subjects here"
+	// [2026-06-11 Thu 14:01] subject
+	// TODO [2026-06-11 Thu 14:01] subject
 	reH4Detail = regexp.MustCompile(`^(TODO\s+)?\[(\d{4}-\d{2}-\d{2}\s+\w+\s+\d{1,2}:\d{2})\]\s*(.*)$`)
 )
 
@@ -142,7 +131,11 @@ func (s *OrgStore) parseLines(lines []string) {
 
 	flushMsg := func() {
 		if curMsg != nil && curDay != nil {
-			curMsg.Body = strings.TrimRight(strings.Join(bodyLines, "\n"), "\n ")
+			body := strings.Join(bodyLines, "\n")
+			// Remove leading empty lines
+			body = strings.TrimLeft(body, "\n\r ")
+			body = strings.TrimRight(body, "\n\r ")
+			curMsg.Body = body
 			curDay.Messages = append(curDay.Messages, curMsg)
 			s.uidMap[curMsg.UID] = curMsg
 		}
@@ -151,13 +144,11 @@ func (s *OrgStore) parseLines(lines []string) {
 	}
 
 	for _, line := range lines {
-		// Check headings from most-specific to least
 		if m := reH4.FindStringSubmatch(line); m != nil {
 			flushMsg()
 			rest := strings.TrimSpace(m[1])
 			msg := &OrgMessage{
-				UID:       s.nextUID,
-				RawHeader: rest,
+				UID: s.nextUID,
 			}
 			s.nextUID++
 
@@ -166,15 +157,15 @@ func (s *OrgStore) parseLines(lines []string) {
 				if msg.IsTODO {
 					msg.Flags = append(msg.Flags, "\\Flagged")
 				}
-				t, err := time.Parse("2006-01-02 Mon 15:04", dm[2])
+				t, err := time.ParseInLocation("2006-01-02 Mon 15:04", dm[2], s.localLoc)
 				if err != nil {
-					t = time.Now()
+					t = time.Now().In(s.localLoc)
 				}
 				msg.Date = t
 				msg.Subject = dm[3]
 			} else {
 				msg.Subject = rest
-				msg.Date = time.Now()
+				msg.Date = time.Now().In(s.localLoc)
 			}
 
 			curMsg = msg
@@ -210,7 +201,6 @@ func (s *OrgStore) parseLines(lines []string) {
 			continue
 		}
 
-		// Body line for current message
 		if curMsg != nil {
 			bodyLines = append(bodyLines, line)
 		}
@@ -218,7 +208,6 @@ func (s *OrgStore) parseLines(lines []string) {
 	flushMsg()
 }
 
-// Save writes the org store back to the file.
 func (s *OrgStore) Save() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -231,25 +220,19 @@ func (s *OrgStore) saveLocked() error {
 		if i > 0 {
 			sb.WriteString("\n")
 		}
-		sb.WriteString("* ")
-		sb.WriteString(y.Title)
-		sb.WriteString("\n")
+		fmt.Fprintf(&sb, "* %s\n", y.Title)
 		for _, mo := range y.Months {
-			sb.WriteString("** ")
-			sb.WriteString(mo.Title)
-			sb.WriteString("\n")
+			fmt.Fprintf(&sb, "** %s\n", mo.Title)
 			for _, d := range mo.Days {
-				sb.WriteString("*** ")
-				sb.WriteString(d.Title)
-				sb.WriteString("\n")
+				fmt.Fprintf(&sb, "*** %s\n", d.Title)
 				for _, msg := range d.Messages {
 					sb.WriteString("**** ")
 					if msg.IsTODO {
 						sb.WriteString("TODO ")
 					}
-					sb.WriteString(fmt.Sprintf("[%s] %s\n",
-						msg.Date.Format("2006-01-02 Mon 15:04"),
-						msg.Subject))
+					fmt.Fprintf(&sb, "[%s] %s\n",
+						msg.Date.In(s.localLoc).Format("2006-01-02 Mon 15:04"),
+						msg.Subject)
 					if msg.Body != "" {
 						sb.WriteString(msg.Body)
 						sb.WriteString("\n")
@@ -261,22 +244,22 @@ func (s *OrgStore) saveLocked() error {
 
 	data := []byte(sb.String())
 	s.lastHash = md5.Sum(data)
-
 	return os.WriteFile(s.filePath, data, 0644)
 }
 
 // ---------------------------------------------------------------------------
-// Folder abstraction
+// Folder operations
 // ---------------------------------------------------------------------------
 
-// FolderPath returns a flat list of IMAP-style folder names.
-// e.g. "INBOX", "2026", "2026/2026-06 June", "2026/2026-06 June/2026-06-12 Friday"
+// FolderPaths returns flat IMAP-style folder names using "/" separator.
+// Only *** (day-level) folders contain messages; year and month folders
+// exist solely as hierarchy containers.
 func (s *OrgStore) FolderPaths() []string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
 	var paths []string
-	paths = append(paths, "INBOX") // virtual top-level
+	paths = append(paths, "INBOX")
 	for _, y := range s.years {
 		yp := y.Title
 		paths = append(paths, yp)
@@ -292,9 +275,9 @@ func (s *OrgStore) FolderPaths() []string {
 	return paths
 }
 
-// MessagesInFolder returns all messages that live in a particular folder path.
-// Only *** (day) level folders contain messages.
-// INBOX returns ALL messages across all folders.
+// MessagesInFolder returns messages for a folder.
+// Only the deepest matching level returns messages — no aggregation upward.
+// INBOX is special: it returns ALL messages (for clients that expect it).
 func (s *OrgStore) MessagesInFolder(folder string) []*OrgMessage {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -306,23 +289,16 @@ func (s *OrgStore) MessagesInFolder(folder string) []*OrgMessage {
 	parts := strings.Split(folder, "/")
 	switch len(parts) {
 	case 1:
-		// Year folder – return all msgs in that year
-		for _, y := range s.years {
-			if y.Title == parts[0] {
-				return s.yearMessages(y)
-			}
-		}
+		// Year-level folder: only return messages that sit directly
+		// in **** under a * heading with no ** or *** intermediary.
+		// In our model **** always lives under ***, so year-level
+		// folders contain no messages themselves.
+		return nil
 	case 2:
-		for _, y := range s.years {
-			if y.Title == parts[0] {
-				for _, mo := range y.Months {
-					if mo.Title == parts[1] {
-						return s.monthMessages(mo)
-					}
-				}
-			}
-		}
+		// Month-level: same reasoning — no direct messages.
+		return nil
 	case 3:
+		// Day-level: this is where messages live.
 		for _, y := range s.years {
 			if y.Title == parts[0] {
 				for _, mo := range y.Months {
@@ -343,40 +319,35 @@ func (s *OrgStore) MessagesInFolder(folder string) []*OrgMessage {
 func (s *OrgStore) allMessages() []*OrgMessage {
 	var msgs []*OrgMessage
 	for _, y := range s.years {
-		msgs = append(msgs, s.yearMessages(y)...)
+		for _, mo := range y.Months {
+			for _, d := range mo.Days {
+				msgs = append(msgs, d.Messages...)
+			}
+		}
 	}
 	return msgs
 }
 
-func (s *OrgStore) yearMessages(y *OrgYear) []*OrgMessage {
-	var msgs []*OrgMessage
-	for _, mo := range y.Months {
-		msgs = append(msgs, s.monthMessages(mo)...)
-	}
-	return msgs
-}
-
-func (s *OrgStore) monthMessages(mo *OrgMonth) []*OrgMessage {
-	var msgs []*OrgMessage
-	for _, d := range mo.Days {
-		msgs = append(msgs, d.Messages...)
-	}
-	return msgs
-}
-
-// AppendMessage adds a new message to the appropriate day folder (creating
-// year/month/day headings as needed). HTML is stripped.
+// AppendMessage adds a message. HTML body is converted to markdown.
+// Subject is decoded to UTF-8.
 func (s *OrgStore) AppendMessage(folder string, date time.Time, subject, body string, flags []string) (*OrgMessage, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	body = stripHTML(body)
+	// Ensure local timezone
+	date = date.In(s.localLoc)
+
+	// Ensure valid UTF-8
 	if !utf8.ValidString(body) {
 		body = strings.ToValidUTF8(body, "?")
 	}
 	if !utf8.ValidString(subject) {
 		subject = strings.ToValidUTF8(subject, "?")
 	}
+
+	// Remove leading blank lines from body
+	body = trimLeadingEmptyLines(body)
+	body = strings.TrimRight(body, "\n\r ")
 
 	isTODO := false
 	for _, f := range flags {
@@ -396,12 +367,12 @@ func (s *OrgStore) AppendMessage(folder string, date time.Time, subject, body st
 	s.nextUID++
 	s.uidMap[msg.UID] = msg
 
-	// Determine target day
+	// Determine target headings from date
 	yearTitle := fmt.Sprintf("%d", date.Year())
 	monthTitle := date.Format("2006-01") + " " + date.Format("January")
 	dayTitle := date.Format("2006-01-02") + " " + date.Format("Monday")
 
-	// If a specific folder was given and it's a 3-level path, use it
+	// Override if a specific 3-level folder was given
 	if folder != "" && !strings.EqualFold(folder, "INBOX") {
 		parts := strings.Split(folder, "/")
 		if len(parts) >= 1 {
@@ -415,54 +386,51 @@ func (s *OrgStore) AppendMessage(folder string, date time.Time, subject, body st
 		}
 	}
 
-	// Find or create year
-	var year *OrgYear
-	for _, y := range s.years {
-		if y.Title == yearTitle {
-			year = y
-			break
-		}
-	}
-	if year == nil {
-		year = &OrgYear{Title: yearTitle}
-		s.years = append(s.years, year)
-		sort.Slice(s.years, func(i, j int) bool {
-			return s.years[i].Title < s.years[j].Title
-		})
-	}
-
-	// Find or create month
-	var month *OrgMonth
-	for _, mo := range year.Months {
-		if mo.Title == monthTitle {
-			month = mo
-			break
-		}
-	}
-	if month == nil {
-		month = &OrgMonth{Title: monthTitle}
-		year.Months = append(year.Months, month)
-	}
-
-	// Find or create day
-	var day *OrgDay
-	for _, d := range month.Days {
-		if d.Title == dayTitle {
-			day = d
-			break
-		}
-	}
-	if day == nil {
-		day = &OrgDay{Title: dayTitle}
-		month.Days = append(month.Days, day)
-	}
+	year := s.findOrCreateYear(yearTitle)
+	month := s.findOrCreateMonth(year, monthTitle)
+	day := s.findOrCreateDay(month, dayTitle)
 
 	day.Messages = append(day.Messages, msg)
 
 	return msg, s.saveLocked()
 }
 
-// DeleteMessage removes a message by UID.
+func (s *OrgStore) findOrCreateYear(title string) *OrgYear {
+	for _, y := range s.years {
+		if y.Title == title {
+			return y
+		}
+	}
+	y := &OrgYear{Title: title}
+	s.years = append(s.years, y)
+	sort.Slice(s.years, func(i, j int) bool {
+		return s.years[i].Title < s.years[j].Title
+	})
+	return y
+}
+
+func (s *OrgStore) findOrCreateMonth(year *OrgYear, title string) *OrgMonth {
+	for _, mo := range year.Months {
+		if mo.Title == title {
+			return mo
+		}
+	}
+	mo := &OrgMonth{Title: title}
+	year.Months = append(year.Months, mo)
+	return mo
+}
+
+func (s *OrgStore) findOrCreateDay(month *OrgMonth, title string) *OrgDay {
+	for _, d := range month.Days {
+		if d.Title == title {
+			return d
+		}
+	}
+	d := &OrgDay{Title: title}
+	month.Days = append(month.Days, d)
+	return d
+}
+
 func (s *OrgStore) DeleteMessage(uid uint32) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -483,7 +451,6 @@ func (s *OrgStore) DeleteMessage(uid uint32) error {
 	return fmt.Errorf("message UID %d not found", uid)
 }
 
-// UpdateFlags sets flags on a message by UID.
 func (s *OrgStore) UpdateFlags(uid uint32, flags []string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -493,16 +460,10 @@ func (s *OrgStore) UpdateFlags(uid uint32, flags []string) error {
 		return fmt.Errorf("UID %d not found", uid)
 	}
 	msg.Flags = flags
-	msg.IsTODO = false
-	for _, f := range flags {
-		if f == "\\Flagged" {
-			msg.IsTODO = true
-		}
-	}
+	msg.IsTODO = containsFlag(flags, "\\Flagged")
 	return s.saveLocked()
 }
 
-// CheckReload re-reads the file if it has changed on disk.
 func (s *OrgStore) CheckReload() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -512,13 +473,11 @@ func (s *OrgStore) CheckReload() bool {
 		return false
 	}
 	if info.ModTime().After(s.modTime) {
-		oldValidity := s.uidValidity
 		err := s.loadLocked()
 		if err != nil {
 			log.Printf("reload error: %v", err)
 			return false
 		}
-		_ = oldValidity
 		s.uidValidity = uint32(time.Now().Unix())
 		return true
 	}
@@ -532,37 +491,435 @@ func (s *OrgStore) UIDValidity() uint32 {
 }
 
 // ---------------------------------------------------------------------------
-// HTML stripping
+// HTML to Markdown conversion
 // ---------------------------------------------------------------------------
 
-var reHTMLTag = regexp.MustCompile(`<[^>]*>`)
+func htmlToMarkdown(s string) string {
+	if !strings.Contains(s, "<") {
+		return s
+	}
 
-func stripHTML(s string) string {
-	s = reHTMLTag.ReplaceAllString(s, "")
-	s = html.UnescapeString(s)
-	return s
+	r := s
+
+	// Block-level elements first (before we strip tags)
+	// <br> / <br/>
+	r = regexp.MustCompile(`(?i)<br\s*/?\s*>`).ReplaceAllString(r, "\n")
+	// <p>...</p>
+	r = regexp.MustCompile(`(?i)<p[^>]*>`).ReplaceAllString(r, "\n\n")
+	r = regexp.MustCompile(`(?i)</p>`).ReplaceAllString(r, "\n")
+	// <div>
+	r = regexp.MustCompile(`(?i)<div[^>]*>`).ReplaceAllString(r, "\n")
+	r = regexp.MustCompile(`(?i)</div>`).ReplaceAllString(r, "\n")
+	// <hr>
+	r = regexp.MustCompile(`(?i)<hr\s*/?\s*>`).ReplaceAllString(r, "\n---\n")
+
+	// Headings: <h1>...<h6>
+	for i := 6; i >= 1; i-- {
+		prefix := strings.Repeat("#", i)
+		re := regexp.MustCompile(fmt.Sprintf(`(?i)<h%d[^>]*>(.*?)</h%d>`, i, i))
+		r = re.ReplaceAllString(r, "\n"+prefix+" $1\n")
+	}
+
+	// Bold: <b>, <strong>
+	r = regexp.MustCompile(`(?i)<(?:b|strong)[^>]*>(.*?)</(?:b|strong)>`).ReplaceAllString(r, "**$1**")
+	// Italic: <i>, <em>
+	r = regexp.MustCompile(`(?i)<(?:i|em)[^>]*>(.*?)</(?:i|em)>`).ReplaceAllString(r, "*$1*")
+	// Code: <code>
+	r = regexp.MustCompile(`(?i)<code[^>]*>(.*?)</code>`).ReplaceAllString(r, "`$1`")
+	// Pre: <pre>
+	r = regexp.MustCompile(`(?i)<pre[^>]*>(.*?)</pre>`).ReplaceAllString(r, "\n#+BEGIN_EXAMPLE\n$1\n#+END_EXAMPLE\n")
+
+	// Links: <a href="url">text</a>
+	r = regexp.MustCompile(`(?i)<a\s+[^>]*href\s*=\s*"([^"]*)"[^>]*>(.*?)</a>`).ReplaceAllString(r, "[[$1][$2]]")
+
+	// Images: <img src="url" alt="text">
+	r = regexp.MustCompile(`(?i)<img\s+[^>]*src\s*=\s*"([^"]*)"[^>]*/?\s*>`).ReplaceAllString(r, "[[$1]]")
+
+	// Lists: <li>
+	r = regexp.MustCompile(`(?i)<li[^>]*>`).ReplaceAllString(r, "\n- ")
+	r = regexp.MustCompile(`(?i)</li>`).ReplaceAllString(r, "")
+	// <ul>, <ol>
+	r = regexp.MustCompile(`(?i)</?(?:ul|ol)[^>]*>`).ReplaceAllString(r, "\n")
+
+	// Blockquote
+	r = regexp.MustCompile(`(?i)<blockquote[^>]*>`).ReplaceAllString(r, "\n#+BEGIN_QUOTE\n")
+	r = regexp.MustCompile(`(?i)</blockquote>`).ReplaceAllString(r, "\n#+END_QUOTE\n")
+
+	// Table elements
+	r = regexp.MustCompile(`(?i)<tr[^>]*>`).ReplaceAllString(r, "|")
+	r = regexp.MustCompile(`(?i)</tr>`).ReplaceAllString(r, "|\n")
+	r = regexp.MustCompile(`(?i)<t[dh][^>]*>`).ReplaceAllString(r, " ")
+	r = regexp.MustCompile(`(?i)</t[dh]>`).ReplaceAllString(r, " |")
+	r = regexp.MustCompile(`(?i)</?table[^>]*>`).ReplaceAllString(r, "\n")
+
+	// Strip <style> and <script> blocks entirely
+	r = regexp.MustCompile(`(?is)<style[^>]*>.*?</style>`).ReplaceAllString(r, "")
+	r = regexp.MustCompile(`(?is)<script[^>]*>.*?</script>`).ReplaceAllString(r, "")
+
+	// Strip all remaining HTML tags
+	r = regexp.MustCompile(`<[^>]*>`).ReplaceAllString(r, "")
+
+	// Decode HTML entities
+	r = decodeHTMLEntities(r)
+
+	// Clean up excessive blank lines
+	r = regexp.MustCompile(`\n{3,}`).ReplaceAllString(r, "\n\n")
+
+	// Remove leading empty lines
+	r = trimLeadingEmptyLines(r)
+	r = strings.TrimRight(r, "\n\r ")
+
+	return r
+}
+
+func decodeHTMLEntities(s string) string {
+	replacements := map[string]string{
+		"&amp;":   "&",
+		"&lt;":    "<",
+		"&gt;":    ">",
+		"&quot;":  "\"",
+		"&apos;":  "'",
+		"&#39;":   "'",
+		"&nbsp;":  " ",
+		"&mdash;": "—",
+		"&ndash;": "–",
+		"&laquo;": "«",
+		"&raquo;": "»",
+		"&copy;":  "©",
+		"&reg;":   "®",
+		"&trade;": "™",
+		"&hellip;": "…",
+	}
+	r := s
+	for entity, char := range replacements {
+		r = strings.ReplaceAll(r, entity, char)
+	}
+	// Numeric entities &#NNN;
+	r = regexp.MustCompile(`&#(\d+);`).ReplaceAllStringFunc(r, func(match string) string {
+		numStr := match[2 : len(match)-1]
+		n, err := strconv.Atoi(numStr)
+		if err != nil || n < 0 || n > 0x10FFFF {
+			return match
+		}
+		return string(rune(n))
+	})
+	// Hex entities &#xHHH;
+	r = regexp.MustCompile(`(?i)&#x([0-9a-f]+);`).ReplaceAllStringFunc(r, func(match string) string {
+		hexStr := match[3 : len(match)-1]
+		n, err := strconv.ParseInt(hexStr, 16, 32)
+		if err != nil || n < 0 || n > 0x10FFFF {
+			return match
+		}
+		return string(rune(n))
+	})
+	return r
+}
+
+func trimLeadingEmptyLines(s string) string {
+	lines := strings.Split(s, "\n")
+	start := 0
+	for start < len(lines) && strings.TrimSpace(lines[start]) == "" {
+		start++
+	}
+	if start >= len(lines) {
+		return ""
+	}
+	return strings.Join(lines[start:], "\n")
 }
 
 // ---------------------------------------------------------------------------
-// RFC 2822 message formatting
+// MIME / RFC2822 parsing
+// ---------------------------------------------------------------------------
+
+// decodeMIMESubject decodes RFC 2047 encoded-words to plain UTF-8
+func decodeMIMESubject(s string) string {
+	dec := new(mime.WordDecoder)
+	result, err := dec.DecodeHeader(s)
+	if err != nil {
+		return s
+	}
+	return result
+}
+
+// parseRFC2822 extracts subject, body, and date from a raw RFC2822 message.
+// HTML parts are converted to markdown. Body is decoded from
+// base64/quoted-printable to plain UTF-8. Subject is decoded to UTF-8.
+func parseRFC2822Full(raw string) (subject, body string, date time.Time) {
+	localLoc := time.Now().Location()
+	date = time.Now().In(localLoc)
+
+	// Normalize line endings to \r\n for header parsing
+	normalized := strings.ReplaceAll(raw, "\r\n", "\n")
+	// Split headers and body at first blank line
+	headerBody := strings.SplitN(normalized, "\n\n", 2)
+
+	headerSection := ""
+	rawBody := ""
+	if len(headerBody) >= 1 {
+		headerSection = headerBody[0]
+	}
+	if len(headerBody) >= 2 {
+		rawBody = headerBody[1]
+	}
+
+	// Parse headers (handle folded headers)
+	headers := parseHeaders(headerSection)
+
+	// Subject
+	if v, ok := headers["subject"]; ok {
+		subject = decodeMIMESubject(v)
+	}
+
+	// Date — parse and convert to local timezone
+	if v, ok := headers["date"]; ok {
+		for _, layout := range []string{
+			time.RFC1123Z,
+			time.RFC1123,
+			time.RFC822Z,
+			time.RFC822,
+			"Mon, 2 Jan 2006 15:04:05 -0700",
+			"Mon, 02 Jan 2006 15:04:05 -0700",
+			"2 Jan 2006 15:04:05 -0700",
+			"Mon, 2 Jan 2006 15:04:05 -0700 (MST)",
+		} {
+			if t, err := time.Parse(layout, strings.TrimSpace(v)); err == nil {
+				date = t.In(localLoc)
+				break
+			}
+		}
+	}
+
+	// Content-Type
+	contentType := headers["content-type"]
+	transferEncoding := strings.ToLower(strings.TrimSpace(headers["content-transfer-encoding"]))
+
+	body = extractBody(rawBody, contentType, transferEncoding)
+
+	// Final cleanup
+	if !utf8.ValidString(body) {
+		body = strings.ToValidUTF8(body, "?")
+	}
+	body = trimLeadingEmptyLines(body)
+	body = strings.TrimRight(body, "\n\r ")
+
+	if !utf8.ValidString(subject) {
+		subject = strings.ToValidUTF8(subject, "?")
+	}
+
+	return
+}
+
+func parseHeaders(section string) map[string]string {
+	headers := make(map[string]string)
+	lines := strings.Split(section, "\n")
+
+	var currentKey string
+	var currentVal strings.Builder
+
+	flush := func() {
+		if currentKey != "" {
+			headers[strings.ToLower(currentKey)] = strings.TrimSpace(currentVal.String())
+		}
+	}
+
+	for _, line := range lines {
+		if len(line) > 0 && (line[0] == ' ' || line[0] == '\t') {
+			// Continuation of previous header
+			if currentKey != "" {
+				currentVal.WriteString(" ")
+				currentVal.WriteString(strings.TrimSpace(line))
+			}
+		} else {
+			flush()
+			colonIdx := strings.IndexByte(line, ':')
+			if colonIdx > 0 {
+				currentKey = line[:colonIdx]
+				currentVal.Reset()
+				currentVal.WriteString(strings.TrimSpace(line[colonIdx+1:]))
+			} else {
+				currentKey = ""
+				currentVal.Reset()
+			}
+		}
+	}
+	flush()
+	return headers
+}
+
+func extractBody(rawBody, contentType, transferEncoding string) string {
+	if contentType == "" {
+		contentType = "text/plain"
+	}
+
+	mediaType, params, err := mime.ParseMediaType(contentType)
+	if err != nil {
+		// Fallback: treat as plain text
+		return decodeTransferEncoding(rawBody, transferEncoding)
+	}
+
+	// Multipart
+	if strings.HasPrefix(mediaType, "multipart/") {
+		boundary := params["boundary"]
+		if boundary == "" {
+			return decodeTransferEncoding(rawBody, transferEncoding)
+		}
+		return parseMultipart(rawBody, boundary)
+	}
+
+	decoded := decodeTransferEncoding(rawBody, transferEncoding)
+
+	// Handle charset
+	if charset, ok := params["charset"]; ok {
+		decoded = ensureUTF8(decoded, charset)
+	}
+
+	if strings.HasPrefix(mediaType, "text/html") {
+		return htmlToMarkdown(decoded)
+	}
+
+	return decoded
+}
+
+func parseMultipart(rawBody, boundary string) string {
+	reader := multipart.NewReader(strings.NewReader(rawBody), boundary)
+
+	var textPlain string
+	var textHTML string
+
+	for {
+		part, err := reader.NextPart()
+		if err != nil {
+			break
+		}
+
+		partCT := part.Header.Get("Content-Type")
+		partTE := strings.ToLower(strings.TrimSpace(part.Header.Get("Content-Transfer-Encoding")))
+
+		partBytes, err := io.ReadAll(part)
+		if err != nil {
+			continue
+		}
+		partBody := string(partBytes)
+
+		mediaType, params, _ := mime.ParseMediaType(partCT)
+
+		if strings.HasPrefix(mediaType, "multipart/") {
+			subBoundary := params["boundary"]
+			if subBoundary != "" {
+				result := parseMultipart(partBody, subBoundary)
+				if result != "" {
+					return result
+				}
+			}
+			continue
+		}
+
+		decoded := decodeTransferEncoding(partBody, partTE)
+		if charset, ok := params["charset"]; ok {
+			decoded = ensureUTF8(decoded, charset)
+		}
+
+		if strings.HasPrefix(mediaType, "text/plain") {
+			textPlain = decoded
+		} else if strings.HasPrefix(mediaType, "text/html") {
+			textHTML = decoded
+		}
+	}
+
+	// Prefer plain text; fall back to HTML→markdown
+	if textPlain != "" {
+		return textPlain
+	}
+	if textHTML != "" {
+		return htmlToMarkdown(textHTML)
+	}
+	return ""
+}
+
+func decodeTransferEncoding(s, encoding string) string {
+	switch encoding {
+	case "base64":
+		// Remove whitespace from base64
+		cleaned := strings.Join(strings.Fields(s), "")
+		decoded, err := base64.StdEncoding.DecodeString(cleaned)
+		if err != nil {
+			// Try with padding
+			for len(cleaned)%4 != 0 {
+				cleaned += "="
+			}
+			decoded, err = base64.StdEncoding.DecodeString(cleaned)
+			if err != nil {
+				return s
+			}
+		}
+		return string(decoded)
+	case "quoted-printable":
+		reader := quotedprintable.NewReader(strings.NewReader(s))
+		decoded, err := io.ReadAll(reader)
+		if err != nil {
+			return s
+		}
+		return string(decoded)
+	default:
+		return s
+	}
+}
+
+// ensureUTF8 is a best-effort charset handler for common encodings.
+// For a production system you'd use golang.org/x/text/encoding, but
+// we keep zero dependencies here.
+func ensureUTF8(s, charset string) string {
+	charset = strings.ToLower(strings.TrimSpace(charset))
+	switch charset {
+	case "utf-8", "utf8", "us-ascii", "ascii", "":
+		return s
+	default:
+		// Best effort: if it's valid UTF-8 already, keep it
+		if utf8.ValidString(s) {
+			return s
+		}
+		return strings.ToValidUTF8(s, "?")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// RFC 2822 message formatting (for IMAP FETCH responses)
 // ---------------------------------------------------------------------------
 
 func formatRFC2822(msg *OrgMessage) string {
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("From: orgmail@localhost\r\n"))
-	sb.WriteString(fmt.Sprintf("To: user@localhost\r\n"))
+	sb.WriteString("From: orgmail@localhost\r\n")
+	sb.WriteString("To: user@localhost\r\n")
 	sb.WriteString(fmt.Sprintf("Date: %s\r\n", msg.Date.Format(time.RFC1123Z)))
-	sb.WriteString(fmt.Sprintf("Subject: %s\r\n", msg.Subject))
+	// Encode subject for RFC2822 compatibility but keep it readable
+	sb.WriteString(fmt.Sprintf("Subject: %s\r\n", encodeSubjectRFC2047(msg.Subject)))
 	sb.WriteString(fmt.Sprintf("Message-ID: <org-%d@localhost>\r\n", msg.UID))
 	sb.WriteString("MIME-Version: 1.0\r\n")
 	sb.WriteString("Content-Type: text/plain; charset=utf-8\r\n")
+	sb.WriteString("Content-Transfer-Encoding: 8bit\r\n")
 	sb.WriteString("\r\n")
-	// Body: convert \n to \r\n
 	body := strings.ReplaceAll(msg.Body, "\r\n", "\n")
 	body = strings.ReplaceAll(body, "\n", "\r\n")
 	sb.WriteString(body)
 	sb.WriteString("\r\n")
 	return sb.String()
+}
+
+func encodeSubjectRFC2047(s string) string {
+	// If pure ASCII, no encoding needed
+	isASCII := true
+	for _, r := range s {
+		if r > 127 {
+			isASCII = false
+			break
+		}
+	}
+	if isASCII {
+		return s
+	}
+	// Use RFC 2047 UTF-8 B encoding
+	encoded := base64.StdEncoding.EncodeToString([]byte(s))
+	return "=?UTF-8?B?" + encoded + "?="
 }
 
 // ---------------------------------------------------------------------------
@@ -604,7 +961,6 @@ func (s *IMAPSession) send(format string, args ...interface{}) {
 
 func (s *IMAPSession) Run() {
 	defer s.conn.Close()
-
 	s.send("* OK [CAPABILITY IMAP4rev1] OrgMail IMAP server ready")
 
 	for s.state != StateLogout {
@@ -616,18 +972,15 @@ func (s *IMAPSession) Run() {
 			return
 		}
 		line = strings.TrimRight(line, "\r\n")
-		log.Printf("C: %s", line)
-
 		if line == "" {
 			continue
 		}
-
+		log.Printf("C: %s", line)
 		s.handleCommand(line)
 	}
 }
 
 func (s *IMAPSession) handleCommand(line string) {
-	// Parse: tag SP command SP args
 	parts := strings.SplitN(line, " ", 3)
 	if len(parts) < 2 {
 		s.send("* BAD Invalid command")
@@ -643,91 +996,63 @@ func (s *IMAPSession) handleCommand(line string) {
 
 	switch cmd {
 	case "CAPABILITY":
-		s.send("* CAPABILITY IMAP4rev1 AUTH=PLAIN")
+		s.send("* CAPABILITY IMAP4rev1 AUTH=PLAIN IDLE")
 		s.send("%s OK CAPABILITY completed", tag)
-
 	case "NOOP":
-		// Check for file changes
 		if s.store.CheckReload() && s.state == StateSelected {
 			msgs := s.store.MessagesInFolder(s.selectedFolder)
 			s.send("* %d EXISTS", len(msgs))
 		}
 		s.send("%s OK NOOP completed", tag)
-
 	case "LOGOUT":
-		s.send("* BYE OrgMail IMAP server logging out")
+		s.send("* BYE OrgMail server logging out")
 		s.send("%s OK LOGOUT completed", tag)
 		s.state = StateLogout
-
 	case "LOGIN":
-		// Accept any credentials (local only, no security needed)
 		s.state = StateAuthenticated
 		s.send("%s OK LOGIN completed", tag)
-
 	case "AUTHENTICATE":
-		// Accept PLAIN auth
 		if strings.ToUpper(args) == "PLAIN" {
 			s.send("+")
-			// Read the base64 credentials line
-			_, err := s.reader.ReadString('\n')
-			if err != nil {
-				return
-			}
+			s.reader.ReadString('\n')
 			s.state = StateAuthenticated
 			s.send("%s OK AUTHENTICATE completed", tag)
 		} else {
-			s.send("%s NO Unsupported auth mechanism", tag)
+			s.send("%s NO Unsupported mechanism", tag)
 		}
-
 	case "LIST":
 		s.handleList(tag, args)
-
 	case "LSUB":
-		s.handleList(tag, args) // treat LSUB same as LIST
-
+		s.handleList(tag, args)
 	case "SELECT", "EXAMINE":
 		s.handleSelect(tag, args, cmd == "EXAMINE")
-
 	case "STATUS":
 		s.handleStatus(tag, args)
-
 	case "FETCH":
 		s.handleFetch(tag, args)
-
 	case "UID":
 		s.handleUID(tag, args)
-
 	case "STORE":
 		s.handleStore(tag, args)
-
 	case "APPEND":
 		s.handleAppend(tag, args)
-
 	case "EXPUNGE":
 		s.handleExpunge(tag)
-
 	case "CLOSE":
 		s.selectedFolder = ""
 		s.state = StateAuthenticated
 		s.send("%s OK CLOSE completed", tag)
-
 	case "SEARCH":
 		s.handleSearch(tag, args)
-
-	case "CREATE", "DELETE", "RENAME", "SUBSCRIBE", "UNSUBSCRIBE":
-		// Stub – not fully implemented
-		s.send("%s OK %s completed", tag, cmd)
-
 	case "CHECK":
 		s.store.CheckReload()
 		s.send("%s OK CHECK completed", tag)
-
+	case "CREATE", "DELETE", "RENAME", "SUBSCRIBE", "UNSUBSCRIBE":
+		s.send("%s OK %s completed", tag, cmd)
 	case "COPY":
-		s.send("%s NO COPY not implemented", tag)
-
+		s.send("%s NO COPY not supported", tag)
 	case "IDLE":
 		s.handleIdle(tag)
-
 	default:
 		s.send("%s BAD Unknown command %s", tag, cmd)
 	}
@@ -738,20 +1063,17 @@ func (s *IMAPSession) handleCommand(line string) {
 // ---------------------------------------------------------------------------
 
 func (s *IMAPSession) handleList(tag, args string) {
-	// Parse reference and mailbox pattern
 	ref, pattern := parseListArgs(args)
 	_ = ref
 
-	folders := s.store.FolderPaths()
-
 	if pattern == "" {
-		// Return hierarchy delimiter
 		s.send(`* LIST (\Noselect) "/" ""`)
 		s.send("%s OK LIST completed", tag)
 		return
 	}
 
-	// Convert IMAP wildcards to regex
+	folders := s.store.FolderPaths()
+
 	regexPattern := "^" + strings.ReplaceAll(strings.ReplaceAll(
 		regexp.QuoteMeta(pattern), `\*`, ".*"), `\%`, "[^/]*") + "$"
 	re, err := regexp.Compile(regexPattern)
@@ -762,8 +1084,6 @@ func (s *IMAPSession) handleList(tag, args string) {
 
 	for _, f := range folders {
 		if re.MatchString(f) {
-			attrs := ""
-			// Check if this folder has children
 			hasChildren := false
 			for _, f2 := range folders {
 				if strings.HasPrefix(f2, f+"/") {
@@ -771,19 +1091,28 @@ func (s *IMAPSession) handleList(tag, args string) {
 					break
 				}
 			}
+
+			// Determine attributes
+			var attrs []string
 			if hasChildren {
-				attrs = `\HasChildren`
+				attrs = append(attrs, `\HasChildren`)
 			} else {
-				attrs = `\HasNoChildren`
+				attrs = append(attrs, `\HasNoChildren`)
 			}
-			s.send(`* LIST (%s) "/" "%s"`, attrs, f)
+
+			// Year and Month folders have no messages — mark as \Noselect
+			depth := strings.Count(f, "/")
+			if f != "INBOX" && depth < 2 {
+				attrs = append(attrs, `\Noselect`)
+			}
+
+			s.send(`* LIST (%s) "/" "%s"`, strings.Join(attrs, " "), f)
 		}
 	}
 	s.send("%s OK LIST completed", tag)
 }
 
 func parseListArgs(args string) (string, string) {
-	// Args can be: "ref" "pattern" or ref pattern
 	parts := parseQuotedStrings(args)
 	if len(parts) >= 2 {
 		return parts[0], parts[1]
@@ -799,11 +1128,7 @@ func parseQuotedStrings(s string) []string {
 	s = strings.TrimSpace(s)
 	for s != "" {
 		s = strings.TrimSpace(s)
-		if s == "" {
-			break
-		}
 		if s[0] == '"' {
-			// Find closing quote
 			end := strings.Index(s[1:], "\"")
 			if end == -1 {
 				result = append(result, s[1:])
@@ -831,26 +1156,34 @@ func parseQuotedStrings(s string) []string {
 func (s *IMAPSession) handleSelect(tag, args string, readonly bool) {
 	folder := strings.Trim(strings.TrimSpace(args), "\"")
 
+	// Verify the folder exists
+	found := false
+	for _, f := range s.store.FolderPaths() {
+		if f == folder {
+			found = true
+			break
+		}
+	}
+	if !found {
+		s.send("%s NO Mailbox not found", tag)
+		return
+	}
+
 	msgs := s.store.MessagesInFolder(folder)
-	if msgs == nil && !strings.EqualFold(folder, "INBOX") {
-		// Check if it's a valid parent folder
-		found := false
-		for _, f := range s.store.FolderPaths() {
-			if f == folder {
-				found = true
-				break
-			}
-		}
-		if !found {
-			s.send("%s NO Mailbox not found", tag)
-			return
-		}
-		msgs = []*OrgMessage{} // empty folder
+	if msgs == nil {
+		msgs = []*OrgMessage{}
 	}
 
 	s.selectedFolder = folder
 	s.readonly = readonly
 	s.state = StateSelected
+
+	unseen := 0
+	for _, m := range msgs {
+		if !containsFlag(m.Flags, "\\Seen") {
+			unseen++
+		}
+	}
 
 	s.send("* %d EXISTS", len(msgs))
 	s.send("* 0 RECENT")
@@ -862,7 +1195,11 @@ func (s *IMAPSession) handleSelect(tag, args string, readonly bool) {
 	}
 	s.send("* OK [UIDNEXT %d] Predicted next UID", nextUID)
 	s.send("* FLAGS (\\Seen \\Answered \\Flagged \\Deleted \\Draft)")
-	s.send("* OK [PERMANENTFLAGS (\\Seen \\Answered \\Flagged \\Deleted \\Draft \\*)] Limited")
+	s.send("* OK [PERMANENTFLAGS (\\Seen \\Answered \\Flagged \\Deleted \\Draft \\*)]")
+
+	if unseen > 0 {
+		s.send("* OK [UNSEEN 1]")
+	}
 
 	if readonly {
 		s.send("%s OK [READ-ONLY] EXAMINE completed", tag)
@@ -876,7 +1213,6 @@ func (s *IMAPSession) handleSelect(tag, args string, readonly bool) {
 // ---------------------------------------------------------------------------
 
 func (s *IMAPSession) handleStatus(tag, args string) {
-	// STATUS "folder" (MESSAGES RECENT UIDNEXT UIDVALIDITY UNSEEN)
 	parts := parseQuotedStrings(args)
 	if len(parts) < 1 {
 		s.send("%s BAD Invalid STATUS arguments", tag)
@@ -884,18 +1220,14 @@ func (s *IMAPSession) handleStatus(tag, args string) {
 	}
 	folder := parts[0]
 	msgs := s.store.MessagesInFolder(folder)
+	if msgs == nil {
+		msgs = []*OrgMessage{}
+	}
 	count := len(msgs)
 
 	unseen := 0
 	for _, m := range msgs {
-		seen := false
-		for _, f := range m.Flags {
-			if f == "\\Seen" {
-				seen = true
-				break
-			}
-		}
-		if !seen {
+		if !containsFlag(m.Flags, "\\Seen") {
 			unseen++
 		}
 	}
@@ -905,7 +1237,7 @@ func (s *IMAPSession) handleStatus(tag, args string) {
 		nextUID = msgs[count-1].UID + 1
 	}
 
-	s.send("* STATUS \"%s\" (MESSAGES %d RECENT 0 UIDNEXT %d UIDVALIDITY %d UNSEEN %d)",
+	s.send(`* STATUS "%s" (MESSAGES %d RECENT 0 UIDNEXT %d UIDVALIDITY %d UNSEEN %d)`,
 		folder, count, nextUID, s.store.UIDValidity(), unseen)
 	s.send("%s OK STATUS completed", tag)
 }
@@ -921,8 +1253,10 @@ func (s *IMAPSession) handleFetch(tag, args string) {
 	}
 
 	msgs := s.store.MessagesInFolder(s.selectedFolder)
+	if msgs == nil {
+		msgs = []*OrgMessage{}
+	}
 
-	// Parse sequence set and data items
 	seqPart, dataPart := splitFetchArgs(args)
 	seqNums := parseSequenceSet(seqPart, len(msgs))
 
@@ -931,7 +1265,7 @@ func (s *IMAPSession) handleFetch(tag, args string) {
 			continue
 		}
 		msg := msgs[seq-1]
-		response := s.buildFetchResponse(seq, msg, dataPart)
+		response := s.buildFetchResponse(msg, dataPart, false)
 		s.send("* %d FETCH (%s)", seq, response)
 	}
 
@@ -939,7 +1273,7 @@ func (s *IMAPSession) handleFetch(tag, args string) {
 }
 
 // ---------------------------------------------------------------------------
-// UID command
+// UID commands
 // ---------------------------------------------------------------------------
 
 func (s *IMAPSession) handleUID(tag, args string) {
@@ -965,7 +1299,7 @@ func (s *IMAPSession) handleUID(tag, args string) {
 	case "STORE":
 		s.handleUIDStore(tag, subArgs)
 	case "COPY":
-		s.send("%s NO COPY not implemented", tag)
+		s.send("%s NO COPY not supported", tag)
 	default:
 		s.send("%s BAD Unknown UID subcommand", tag)
 	}
@@ -973,16 +1307,18 @@ func (s *IMAPSession) handleUID(tag, args string) {
 
 func (s *IMAPSession) handleUIDFetch(tag, args string) {
 	msgs := s.store.MessagesInFolder(s.selectedFolder)
+	if msgs == nil {
+		msgs = []*OrgMessage{}
+	}
 
 	seqPart, dataPart := splitFetchArgs(args)
 	uids := parseUIDSet(seqPart, msgs)
 
 	for _, uid := range uids {
-		// Find sequence number and message
 		for seq, msg := range msgs {
 			if msg.UID == uid {
-				response := s.buildFetchResponse(seq+1, msg, dataPart)
-				s.send("* %d FETCH (UID %d %s)", seq+1, msg.UID, response)
+				response := s.buildFetchResponse(msg, dataPart, true)
+				s.send("* %d FETCH (%s)", seq+1, response)
 				break
 			}
 		}
@@ -993,11 +1329,13 @@ func (s *IMAPSession) handleUIDFetch(tag, args string) {
 
 func (s *IMAPSession) handleUIDSearch(tag, args string) {
 	msgs := s.store.MessagesInFolder(s.selectedFolder)
+	if msgs == nil {
+		msgs = []*OrgMessage{}
+	}
 
-	criteria := strings.ToUpper(strings.TrimSpace(args))
+	criteria := strings.TrimSpace(args)
 
 	var matchedUIDs []string
-
 	for _, msg := range msgs {
 		if matchesCriteria(msg, criteria) {
 			matchedUIDs = append(matchedUIDs, fmt.Sprintf("%d", msg.UID))
@@ -1014,8 +1352,10 @@ func (s *IMAPSession) handleUIDSearch(tag, args string) {
 
 func (s *IMAPSession) handleUIDStore(tag, args string) {
 	msgs := s.store.MessagesInFolder(s.selectedFolder)
+	if msgs == nil {
+		msgs = []*OrgMessage{}
+	}
 
-	// Parse: uid-set +FLAGS (\Seen) etc
 	parts := strings.SplitN(args, " ", 3)
 	if len(parts) < 3 {
 		s.send("%s BAD Invalid UID STORE arguments", tag)
@@ -1024,37 +1364,15 @@ func (s *IMAPSession) handleUIDStore(tag, args string) {
 
 	uids := parseUIDSet(parts[0], msgs)
 	action := strings.ToUpper(parts[1])
-	flagsStr := parts[2]
-	newFlags := parseFlagList(flagsStr)
+	newFlags := parseFlagList(parts[2])
 
 	for _, uid := range uids {
 		for seq, msg := range msgs {
 			if msg.UID == uid {
-				switch {
-				case strings.HasPrefix(action, "+FLAGS"):
-					for _, f := range newFlags {
-						if !containsFlag(msg.Flags, f) {
-							msg.Flags = append(msg.Flags, f)
-						}
-					}
-				case strings.HasPrefix(action, "-FLAGS"):
-					var remaining []string
-					for _, f := range msg.Flags {
-						if !containsFlag(newFlags, f) {
-							remaining = append(remaining, f)
-						}
-					}
-					msg.Flags = remaining
-				case action == "FLAGS" || action == "FLAGS.SILENT":
-					msg.Flags = newFlags
-				}
-
-				msg.IsTODO = containsFlag(msg.Flags, "\\Flagged")
-
+				applyFlagAction(msg, action, newFlags)
 				if !strings.HasSuffix(action, ".SILENT") {
 					s.send("* %d FETCH (UID %d FLAGS (%s))", seq+1, msg.UID, strings.Join(msg.Flags, " "))
 				}
-
 				s.store.UpdateFlags(uid, msg.Flags)
 				break
 			}
@@ -1075,6 +1393,9 @@ func (s *IMAPSession) handleStore(tag, args string) {
 	}
 
 	msgs := s.store.MessagesInFolder(s.selectedFolder)
+	if msgs == nil {
+		msgs = []*OrgMessage{}
+	}
 
 	parts := strings.SplitN(args, " ", 3)
 	if len(parts) < 3 {
@@ -1091,35 +1412,36 @@ func (s *IMAPSession) handleStore(tag, args string) {
 			continue
 		}
 		msg := msgs[seq-1]
-
-		switch {
-		case strings.HasPrefix(action, "+FLAGS"):
-			for _, f := range newFlags {
-				if !containsFlag(msg.Flags, f) {
-					msg.Flags = append(msg.Flags, f)
-				}
-			}
-		case strings.HasPrefix(action, "-FLAGS"):
-			var remaining []string
-			for _, f := range msg.Flags {
-				if !containsFlag(newFlags, f) {
-					remaining = append(remaining, f)
-				}
-			}
-			msg.Flags = remaining
-		case action == "FLAGS" || action == "FLAGS.SILENT":
-			msg.Flags = newFlags
-		}
-
-		msg.IsTODO = containsFlag(msg.Flags, "\\Flagged")
-		s.store.UpdateFlags(msg.UID, msg.Flags)
-
+		applyFlagAction(msg, action, newFlags)
 		if !strings.HasSuffix(action, ".SILENT") {
 			s.send("* %d FETCH (FLAGS (%s))", seq, strings.Join(msg.Flags, " "))
 		}
+		s.store.UpdateFlags(msg.UID, msg.Flags)
 	}
 
 	s.send("%s OK STORE completed", tag)
+}
+
+func applyFlagAction(msg *OrgMessage, action string, newFlags []string) {
+	switch {
+	case strings.HasPrefix(action, "+FLAGS"):
+		for _, f := range newFlags {
+			if !containsFlag(msg.Flags, f) {
+				msg.Flags = append(msg.Flags, f)
+			}
+		}
+	case strings.HasPrefix(action, "-FLAGS"):
+		var remaining []string
+		for _, f := range msg.Flags {
+			if !containsFlag(newFlags, f) {
+				remaining = append(remaining, f)
+			}
+		}
+		msg.Flags = remaining
+	default: // FLAGS or FLAGS.SILENT
+		msg.Flags = newFlags
+	}
+	msg.IsTODO = containsFlag(msg.Flags, "\\Flagged")
 }
 
 // ---------------------------------------------------------------------------
@@ -1133,17 +1455,20 @@ func (s *IMAPSession) handleSearch(tag, args string) {
 	}
 
 	msgs := s.store.MessagesInFolder(s.selectedFolder)
-	criteria := strings.ToUpper(strings.TrimSpace(args))
+	if msgs == nil {
+		msgs = []*OrgMessage{}
+	}
+	criteria := strings.TrimSpace(args)
 
-	var matchedSeqs []string
+	var matched []string
 	for i, msg := range msgs {
 		if matchesCriteria(msg, criteria) {
-			matchedSeqs = append(matchedSeqs, fmt.Sprintf("%d", i+1))
+			matched = append(matched, fmt.Sprintf("%d", i+1))
 		}
 	}
 
-	if len(matchedSeqs) > 0 {
-		s.send("* SEARCH %s", strings.Join(matchedSeqs, " "))
+	if len(matched) > 0 {
+		s.send("* SEARCH %s", strings.Join(matched, " "))
 	} else {
 		s.send("* SEARCH")
 	}
@@ -1151,23 +1476,25 @@ func (s *IMAPSession) handleSearch(tag, args string) {
 }
 
 func matchesCriteria(msg *OrgMessage, criteria string) bool {
-	// Simple criteria matching
-	if criteria == "ALL" || criteria == "" {
+	upper := strings.ToUpper(criteria)
+	if upper == "ALL" || upper == "" {
 		return true
 	}
-	if strings.Contains(criteria, "UNSEEN") {
+	if strings.Contains(upper, "UNSEEN") {
 		return !containsFlag(msg.Flags, "\\Seen")
 	}
-	if strings.Contains(criteria, "SEEN") {
+	if strings.Contains(upper, "SEEN") && !strings.Contains(upper, "UNSEEN") {
 		return containsFlag(msg.Flags, "\\Seen")
 	}
-	if strings.Contains(criteria, "FLAGGED") {
+	if strings.Contains(upper, "FLAGGED") {
 		return containsFlag(msg.Flags, "\\Flagged")
 	}
-	if strings.Contains(criteria, "DELETED") {
+	if strings.Contains(upper, "DELETED") {
 		return containsFlag(msg.Flags, "\\Deleted")
 	}
-	// Default: match all
+	if strings.Contains(upper, "NOT DELETED") {
+		return !containsFlag(msg.Flags, "\\Deleted")
+	}
 	return true
 }
 
@@ -1176,55 +1503,59 @@ func matchesCriteria(msg *OrgMessage, criteria string) bool {
 // ---------------------------------------------------------------------------
 
 func (s *IMAPSession) handleAppend(tag, args string) {
-	// APPEND "folder" (\Flags) {size}
+	// APPEND "folder" (\flags) "date" {size}
 	// or APPEND "folder" {size}
-	parts := parseQuotedStrings(args)
-	folder := "INBOX"
-	if len(parts) >= 1 {
-		folder = parts[0]
+	folder, rest := parseFirstQuotedOrAtom(args)
+
+	// Parse optional flags
+	var flags []string
+	if idx := strings.Index(rest, "("); idx != -1 {
+		end := strings.Index(rest, ")")
+		if end != -1 {
+			flags = parseFlagList(rest[idx : end+1])
+			rest = rest[end+1:]
+		}
 	}
 
-	// Find the literal size {NNN}
-	idx := strings.LastIndex(args, "{")
-	if idx == -1 {
+	// Parse optional date-time (quoted)
+	rest = strings.TrimSpace(rest)
+	if len(rest) > 0 && rest[0] == '"' {
+		endQ := strings.Index(rest[1:], "\"")
+		if endQ != -1 {
+			// dateStr := rest[1 : endQ+1]
+			// We ignore the date from APPEND; we'll parse from headers
+			rest = rest[endQ+2:]
+		}
+	}
+
+	// Find literal size
+	rest = strings.TrimSpace(rest)
+	if !strings.HasPrefix(rest, "{") || !strings.HasSuffix(rest, "}") {
 		s.send("%s BAD Missing literal size", tag)
 		return
 	}
-	sizeStr := args[idx+1 : len(args)-1]
+	sizeStr := rest[1 : len(rest)-1]
+	// Handle optional + for literal+
+	sizeStr = strings.TrimSuffix(sizeStr, "+")
 	size, err := strconv.Atoi(sizeStr)
 	if err != nil {
 		s.send("%s BAD Invalid literal size", tag)
 		return
 	}
 
-	// Parse flags between folder and literal
-	flagStr := ""
-	afterFolder := args[len(parts[0])+2:] // skip past folder + quotes
-	if fIdx := strings.Index(afterFolder, "("); fIdx != -1 {
-		fEnd := strings.Index(afterFolder, ")")
-		if fEnd != -1 {
-			flagStr = afterFolder[fIdx+1 : fEnd]
-		}
-	}
-	flags := parseFlagList("(" + flagStr + ")")
-
-	// Send continuation
 	s.send("+ Ready for literal data")
 
-	// Read exactly `size` bytes
 	buf := make([]byte, size)
 	_, err = io.ReadFull(s.reader, buf)
 	if err != nil {
-		s.send("%s BAD Failed to read literal data", tag)
+		s.send("%s BAD Failed to read literal", tag)
 		return
 	}
 
-	// Read the trailing CRLF
+	// Read trailing CRLF
 	s.reader.ReadString('\n')
 
-	// Parse the RFC2822 message
-	msgContent := string(buf)
-	subject, body, date := parseRFC2822(msgContent)
+	subject, body, date := parseRFC2822Full(string(buf))
 
 	_, err = s.store.AppendMessage(folder, date, subject, body, flags)
 	if err != nil {
@@ -1235,52 +1566,23 @@ func (s *IMAPSession) handleAppend(tag, args string) {
 	s.send("%s OK APPEND completed", tag)
 }
 
-func parseRFC2822(raw string) (subject, body string, date time.Time) {
-	date = time.Now()
-
-	// Split headers and body
-	parts := strings.SplitN(raw, "\r\n\r\n", 2)
-	if len(parts) < 2 {
-		parts = strings.SplitN(raw, "\n\n", 2)
+func parseFirstQuotedOrAtom(s string) (string, string) {
+	s = strings.TrimSpace(s)
+	if len(s) == 0 {
+		return "", ""
 	}
-
-	headers := ""
-	if len(parts) >= 1 {
-		headers = parts[0]
-	}
-	if len(parts) >= 2 {
-		body = parts[1]
-	}
-
-	// Parse headers
-	for _, line := range strings.Split(headers, "\n") {
-		line = strings.TrimRight(line, "\r")
-		lower := strings.ToLower(line)
-		if strings.HasPrefix(lower, "subject:") {
-			subject = strings.TrimSpace(line[8:])
+	if s[0] == '"' {
+		end := strings.Index(s[1:], "\"")
+		if end == -1 {
+			return s[1:], ""
 		}
-		if strings.HasPrefix(lower, "date:") {
-			dateStr := strings.TrimSpace(line[5:])
-			for _, layout := range []string{
-				time.RFC1123Z,
-				time.RFC1123,
-				time.RFC822Z,
-				time.RFC822,
-				"Mon, 2 Jan 2006 15:04:05 -0700",
-				"2 Jan 2006 15:04:05 -0700",
-			} {
-				if t, err := time.Parse(layout, dateStr); err == nil {
-					date = t
-					break
-				}
-			}
-		}
+		return s[1 : end+1], strings.TrimSpace(s[end+2:])
 	}
-
-	body = stripHTML(body)
-	body = strings.TrimRight(body, "\r\n ")
-
-	return
+	idx := strings.IndexByte(s, ' ')
+	if idx == -1 {
+		return s, ""
+	}
+	return s[:idx], strings.TrimSpace(s[idx+1:])
 }
 
 // ---------------------------------------------------------------------------
@@ -1295,17 +1597,27 @@ func (s *IMAPSession) handleExpunge(tag string) {
 
 	msgs := s.store.MessagesInFolder(s.selectedFolder)
 
-	// Find messages marked \Deleted and remove them
-	var toDelete []uint32
-	for seq, msg := range msgs {
+	// Collect UIDs to delete (in reverse order to keep sequence numbers valid)
+	type delEntry struct {
+		seq int
+		uid uint32
+	}
+	var toDelete []delEntry
+	for i, msg := range msgs {
 		if containsFlag(msg.Flags, "\\Deleted") {
-			toDelete = append(toDelete, msg.UID)
-			s.send("* %d EXPUNGE", seq+1)
+			toDelete = append(toDelete, delEntry{seq: i + 1, uid: msg.UID})
 		}
 	}
 
-	for _, uid := range toDelete {
-		s.store.DeleteMessage(uid)
+	// Send EXPUNGE responses (must account for shifting)
+	offset := 0
+	for _, d := range toDelete {
+		s.send("* %d EXPUNGE", d.seq-offset)
+		offset++
+	}
+
+	for _, d := range toDelete {
+		s.store.DeleteMessage(d.uid)
 	}
 
 	s.send("%s OK EXPUNGE completed", tag)
@@ -1318,9 +1630,7 @@ func (s *IMAPSession) handleExpunge(tag string) {
 func (s *IMAPSession) handleIdle(tag string) {
 	s.send("+ idling")
 
-	// Poll for changes every 2 seconds or until client sends DONE
 	doneCh := make(chan struct{})
-
 	go func() {
 		for {
 			line, err := s.reader.ReadString('\n')
@@ -1357,7 +1667,6 @@ func (s *IMAPSession) handleIdle(tag string) {
 // ---------------------------------------------------------------------------
 
 func splitFetchArgs(args string) (string, string) {
-	// Sequence set is first token, rest is data items
 	idx := strings.IndexByte(args, ' ')
 	if idx == -1 {
 		return args, "ALL"
@@ -1365,33 +1674,35 @@ func splitFetchArgs(args string) (string, string) {
 	return args[:idx], args[idx+1:]
 }
 
-func (s *IMAPSession) buildFetchResponse(seq int, msg *OrgMessage, dataItems string) string {
+func (s *IMAPSession) buildFetchResponse(msg *OrgMessage, dataItems string, includeUID bool) string {
 	var parts []string
 
 	items := strings.ToUpper(dataItems)
 
 	// Expand macros
-	if items == "ALL" || items == "(ALL)" {
+	switch strings.Trim(items, "()") {
+	case "ALL":
 		items = "FLAGS INTERNALDATE RFC822.SIZE ENVELOPE"
-	}
-	if items == "FULL" || items == "(FULL)" {
+	case "FULL":
 		items = "FLAGS INTERNALDATE RFC822.SIZE ENVELOPE BODY"
-	}
-	if items == "FAST" || items == "(FAST)" {
+	case "FAST":
 		items = "FLAGS INTERNALDATE RFC822.SIZE"
 	}
 
-	// Remove outer parens
 	items = strings.Trim(items, "()")
-
 	rfc2822 := formatRFC2822(msg)
+
+	if includeUID || strings.Contains(items, "UID") {
+		parts = append(parts, fmt.Sprintf("UID %d", msg.UID))
+	}
 
 	if strings.Contains(items, "FLAGS") {
 		parts = append(parts, fmt.Sprintf("FLAGS (%s)", strings.Join(msg.Flags, " ")))
 	}
 
 	if strings.Contains(items, "INTERNALDATE") {
-		parts = append(parts, fmt.Sprintf(`INTERNALDATE "%s"`, msg.Date.Format("02-Jan-2006 15:04:05 -0700")))
+		parts = append(parts, fmt.Sprintf(`INTERNALDATE "%s"`,
+			msg.Date.Format("02-Jan-2006 15:04:05 -0700")))
 	}
 
 	if strings.Contains(items, "RFC822.SIZE") {
@@ -1399,73 +1710,71 @@ func (s *IMAPSession) buildFetchResponse(seq int, msg *OrgMessage, dataItems str
 	}
 
 	if strings.Contains(items, "RFC822.HEADER") {
-		headerEnd := strings.Index(rfc2822, "\r\n\r\n")
-		header := rfc2822
-		if headerEnd != -1 {
-			header = rfc2822[:headerEnd+4]
-		}
+		header := extractRFC2822Header(rfc2822)
 		parts = append(parts, fmt.Sprintf("RFC822.HEADER {%d}\r\n%s", len(header), header))
 	}
 
-	if strings.Contains(items, "BODY.PEEK[HEADER.FIELDS") || strings.Contains(items, "BODY[HEADER.FIELDS") {
-		// Extract wanted fields
-		headerEnd := strings.Index(rfc2822, "\r\n\r\n")
-		header := rfc2822
-		if headerEnd != -1 {
-			header = rfc2822[:headerEnd+4]
-		}
-
-		// Figure out which fields are requested
-		fieldStart := strings.Index(items, "(")
-		fieldEnd := strings.Index(items, ")")
+	// BODY.PEEK[HEADER.FIELDS (...)] or BODY[HEADER.FIELDS (...)]
+	if idx := strings.Index(items, "HEADER.FIELDS"); idx != -1 {
+		header := extractRFC2822Header(rfc2822)
+		fieldStart := strings.Index(items[idx:], "(")
+		fieldEnd := strings.Index(items[idx:], ")")
 		requestedFields := ""
 		if fieldStart != -1 && fieldEnd != -1 {
-			requestedFields = items[fieldStart+1 : fieldEnd]
+			requestedFields = items[idx+fieldStart+1 : idx+fieldEnd]
 		}
-
-		filteredHeader := filterHeaders(header, requestedFields)
-
-		// Determine the exact item name to use in response
+		filtered := filterHeaders(header, requestedFields)
 		itemName := "BODY[HEADER.FIELDS (" + requestedFields + ")]"
-		parts = append(parts, fmt.Sprintf("%s {%d}\r\n%s", itemName, len(filteredHeader), filteredHeader))
+		parts = append(parts, fmt.Sprintf("%s {%d}\r\n%s", itemName, len(filtered), filtered))
 	} else if strings.Contains(items, "BODY.PEEK[]") || strings.Contains(items, "BODY[]") {
 		parts = append(parts, fmt.Sprintf("BODY[] {%d}\r\n%s", len(rfc2822), rfc2822))
 	} else if strings.Contains(items, "BODY.PEEK[HEADER]") || strings.Contains(items, "BODY[HEADER]") {
-		headerEnd := strings.Index(rfc2822, "\r\n\r\n")
-		header := rfc2822
-		if headerEnd != -1 {
-			header = rfc2822[:headerEnd+4]
-		}
+		header := extractRFC2822Header(rfc2822)
 		parts = append(parts, fmt.Sprintf("BODY[HEADER] {%d}\r\n%s", len(header), header))
 	} else if strings.Contains(items, "BODY.PEEK[TEXT]") || strings.Contains(items, "BODY[TEXT]") {
-		headerEnd := strings.Index(rfc2822, "\r\n\r\n")
-		text := ""
-		if headerEnd != -1 {
-			text = rfc2822[headerEnd+4:]
-		}
+		text := extractRFC2822Body(rfc2822)
 		parts = append(parts, fmt.Sprintf("BODY[TEXT] {%d}\r\n%s", len(text), text))
 	} else if strings.Contains(items, "RFC822") && !strings.Contains(items, "RFC822.SIZE") && !strings.Contains(items, "RFC822.HEADER") {
 		parts = append(parts, fmt.Sprintf("RFC822 {%d}\r\n%s", len(rfc2822), rfc2822))
 	}
 
 	if strings.Contains(items, "ENVELOPE") {
-		env := fmt.Sprintf(`(%s "%s" (("orgmail" NIL "orgmail" "localhost")) (("orgmail" NIL "orgmail" "localhost")) (("orgmail" NIL "orgmail" "localhost")) (("user" NIL "user" "localhost")) NIL NIL NIL "<org-%d@localhost>")`,
-			`"`+msg.Date.Format("Mon, 02 Jan 2006 15:04:05 -0700")+`"`,
-			escapeIMAPString(msg.Subject),
-			msg.UID)
+		env := buildEnvelope(msg)
 		parts = append(parts, "ENVELOPE "+env)
 	}
 
 	if strings.Contains(items, "BODYSTRUCTURE") {
-		parts = append(parts, fmt.Sprintf(`BODYSTRUCTURE ("TEXT" "PLAIN" ("CHARSET" "UTF-8") NIL NIL "7BIT" %d %d)`,
-			len(msg.Body), strings.Count(msg.Body, "\n")+1))
-	}
-
-	if strings.Contains(items, "UID") {
-		parts = append(parts, fmt.Sprintf("UID %d", msg.UID))
+		bodyLen := len(msg.Body)
+		bodyLines := strings.Count(msg.Body, "\n") + 1
+		parts = append(parts, fmt.Sprintf(
+			`BODYSTRUCTURE ("TEXT" "PLAIN" ("CHARSET" "UTF-8") NIL NIL "8BIT" %d %d)`,
+			bodyLen, bodyLines))
 	}
 
 	return strings.Join(parts, " ")
+}
+
+func extractRFC2822Header(rfc2822 string) string {
+	idx := strings.Index(rfc2822, "\r\n\r\n")
+	if idx == -1 {
+		return rfc2822
+	}
+	return rfc2822[:idx+4]
+}
+
+func extractRFC2822Body(rfc2822 string) string {
+	idx := strings.Index(rfc2822, "\r\n\r\n")
+	if idx == -1 {
+		return ""
+	}
+	return rfc2822[idx+4:]
+}
+
+func buildEnvelope(msg *OrgMessage) string {
+	return fmt.Sprintf(`("%s" "%s" (("orgmail" NIL "orgmail" "localhost")) (("orgmail" NIL "orgmail" "localhost")) (("orgmail" NIL "orgmail" "localhost")) (("user" NIL "user" "localhost")) NIL NIL NIL "<org-%d@localhost>")`,
+		msg.Date.Format("Mon, 02 Jan 2006 15:04:05 -0700"),
+		escapeIMAPString(msg.Subject),
+		msg.UID)
 }
 
 func filterHeaders(header string, fields string) string {
@@ -1474,7 +1783,7 @@ func filterHeaders(header string, fields string) string {
 		wanted[strings.ToUpper(strings.TrimSpace(f))] = true
 	}
 
-	var result strings.Builder
+	var result bytes.Buffer
 	lines := strings.Split(header, "\r\n")
 	include := false
 	for _, line := range lines {
@@ -1482,10 +1791,9 @@ func filterHeaders(header string, fields string) string {
 			result.WriteString("\r\n")
 			continue
 		}
-		if line[0] != ' ' && line[0] != '\t' {
-			// New header
+		if len(line) > 0 && line[0] != ' ' && line[0] != '\t' {
 			colonIdx := strings.IndexByte(line, ':')
-			if colonIdx != -1 {
+			if colonIdx > 0 {
 				name := strings.ToUpper(strings.TrimSpace(line[:colonIdx]))
 				include = wanted[name]
 			} else {
@@ -1513,22 +1821,23 @@ func escapeIMAPString(s string) string {
 
 func parseSequenceSet(set string, total int) []int {
 	var result []int
-	set = strings.TrimSpace(set)
-	for _, part := range strings.Split(set, ",") {
+	for _, part := range strings.Split(strings.TrimSpace(set), ",") {
 		part = strings.TrimSpace(part)
 		if strings.Contains(part, ":") {
-			rangeParts := strings.SplitN(part, ":", 2)
-			start := resolveSeqNum(rangeParts[0], total)
-			end := resolveSeqNum(rangeParts[1], total)
+			rp := strings.SplitN(part, ":", 2)
+			start := resolveSeqNum(rp[0], total)
+			end := resolveSeqNum(rp[1], total)
 			if start > end {
 				start, end = end, start
 			}
 			for i := start; i <= end; i++ {
-				result = append(result, i)
+				if i >= 1 && i <= total {
+					result = append(result, i)
+				}
 			}
 		} else {
 			n := resolveSeqNum(part, total)
-			if n > 0 {
+			if n >= 1 && n <= total {
 				result = append(result, n)
 			}
 		}
@@ -1537,11 +1846,10 @@ func parseSequenceSet(set string, total int) []int {
 }
 
 func resolveSeqNum(s string, total int) int {
-	s = strings.TrimSpace(s)
-	if s == "*" {
+	if strings.TrimSpace(s) == "*" {
 		return total
 	}
-	n, _ := strconv.Atoi(s)
+	n, _ := strconv.Atoi(strings.TrimSpace(s))
 	return n
 }
 
@@ -1550,15 +1858,14 @@ func parseUIDSet(set string, msgs []*OrgMessage) []uint32 {
 	if len(msgs) == 0 {
 		return result
 	}
-
 	maxUID := msgs[len(msgs)-1].UID
 
-	for _, part := range strings.Split(set, ",") {
+	for _, part := range strings.Split(strings.TrimSpace(set), ",") {
 		part = strings.TrimSpace(part)
 		if strings.Contains(part, ":") {
-			rangeParts := strings.SplitN(part, ":", 2)
-			start := resolveUID(rangeParts[0], maxUID)
-			end := resolveUID(rangeParts[1], maxUID)
+			rp := strings.SplitN(part, ":", 2)
+			start := resolveUID(rp[0], maxUID)
+			end := resolveUID(rp[1], maxUID)
 			if start > end {
 				start, end = end, start
 			}
@@ -1581,16 +1888,15 @@ func parseUIDSet(set string, msgs []*OrgMessage) []uint32 {
 }
 
 func resolveUID(s string, maxUID uint32) uint32 {
-	s = strings.TrimSpace(s)
-	if s == "*" {
+	if strings.TrimSpace(s) == "*" {
 		return maxUID
 	}
-	n, _ := strconv.ParseUint(s, 10, 32)
+	n, _ := strconv.ParseUint(strings.TrimSpace(s), 10, 32)
 	return uint32(n)
 }
 
 // ---------------------------------------------------------------------------
-// Flag parsing helpers
+// Flag helpers
 // ---------------------------------------------------------------------------
 
 func parseFlagList(s string) []string {
@@ -1602,7 +1908,6 @@ func parseFlagList(s string) []string {
 	}
 	var flags []string
 	for _, f := range strings.Fields(s) {
-		f = strings.TrimSpace(f)
 		if f != "" {
 			flags = append(flags, f)
 		}
@@ -1611,9 +1916,9 @@ func parseFlagList(s string) []string {
 }
 
 func containsFlag(flags []string, flag string) bool {
-	flag = strings.ToUpper(flag)
+	upper := strings.ToUpper(flag)
 	for _, f := range flags {
-		if strings.ToUpper(f) == flag {
+		if strings.ToUpper(f) == upper {
 			return true
 		}
 	}
@@ -1640,23 +1945,31 @@ func main() {
 		log.Fatalf("Failed to load org file: %v", err)
 	}
 
-	msgs := store.allMessages()
-	log.Printf("Loaded %d messages from %s", len(msgs), orgFile)
+	log.Printf("Loaded org file: %s (timezone: %s)", orgFile, store.localLoc.String())
+	folders := store.FolderPaths()
+	for _, f := range folders {
+		msgs := store.MessagesInFolder(f)
+		if len(msgs) > 0 {
+			log.Printf("  [%s] %d messages", f, len(msgs))
+		}
+	}
 
 	listener, err := net.Listen("tcp", listenAddr)
 	if err != nil {
-		log.Fatalf("Failed to listen on %s: %v", listenAddr, err)
+		log.Fatalf("Failed to listen: %v", err)
 	}
 	defer listener.Close()
 
-	log.Printf("IMAP server listening on %s (org file: %s)", listenAddr, orgFile)
+	log.Printf("IMAP server listening on %s", listenAddr)
 
-	// File watcher goroutine
+	// Background file watcher
 	go func() {
 		ticker := time.NewTicker(3 * time.Second)
 		defer ticker.Stop()
 		for range ticker.C {
-			store.CheckReload()
+			if store.CheckReload() {
+				log.Println("Org file changed on disk, reloaded")
+			}
 		}
 	}()
 
@@ -1676,8 +1989,7 @@ func main() {
 			log.Printf("Accept error: %v", err)
 			continue
 		}
-		log.Printf("New connection from %s", conn.RemoteAddr())
-		session := NewIMAPSession(conn, store)
-		go session.Run()
+		log.Printf("Connection from %s", conn.RemoteAddr())
+		go NewIMAPSession(conn, store).Run()
 	}
 }
